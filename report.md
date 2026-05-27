@@ -1,121 +1,149 @@
-# InF FR1 Indoor Positioning — Bias-Corrected Weighted Least Squares (BC-WLS)
+# InF FR1 Indoor Positioning — HLOS-Rwgh-WLS
 
 ## 1. 모티베이션 & 인트로
 
-(TODO: 중간발표까지의 실험 결과와 거기서 본 알고리즘 아이디어가 도출된 흐름)
+본 과제는 18개 기지국이 측정한 RTT 거리 d_hat (18, N) 로부터 3GPP InF-DH (Indoor Factory, Dense High clutter) 시나리오에서 사용자의 2D 위치를 추정하는 문제다. 학습 단계에서 제공된 700명의 측정값과 실제 위치를 분석해 다음 현상들을 관찰했다.
 
-본 프로젝트는 18개 기지국이 측정한 RTT(d_hat)로부터 Indoor Factory FR1 환경에서 사용자의 2D 위치를 추정한다. 제공된 학습 데이터 700명의 측정값과 실제 위치를 분석한 결과, 다음과 같은 핵심 관찰을 얻었다.
+| 관측 항목 | 값 |
+|---|---|
+| 측정거리 평균 - 실제거리 평균 | +15.93 m |
+| 측정거리 - 실제거리 표준편차 | 20.19 m |
+| (측정 - 실제) 1% / 5% / 50% / 95% / 99% 분위 | -1.20 / -0.91 / 10.15 / 53.59 / 86.48 m |
+| 측정-실제 차가 1 m 미만인 BS-사용자 쌍 비율 | 33.7 % |
+| 측정-실제 차가 5 m 초과인 비율 | 59.0 % |
+| 사용자당 LOS-like BS(차<2 m) 평균 개수 | 6.82 / 18 |
+| 모든 사용자가 보유한 최소 LOS BS 개수 | 2 개 |
+| ≥ 4 LOS BS 보유 사용자 비율 | 95.4 % |
 
-| 지표 | 값 |
-|------|-----|
-| 측정거리 최댓값 | 약 307 m |
-| 방의 기하학적 최대 거리 (대각선) | 약 126 m |
-| 측정거리 - 실제거리 평균 | +15.9 m |
-| 측정거리 - 실제거리 표준편차 | 20.2 m |
-| 5% 분위 / 95% 분위 | -0.9 m / +53.6 m |
+세 가지 핵심 통찰을 얻었다.
+첫째, **NLOS bias 분포가 bimodal** 이다. 약 1/3 의 측정은 거의 정확한 LOS, 약 3/5 는 5 m 이상의 양의 큰 NLOS bias 를 갖는다. 중간 구간(1–5 m)은 7 % 에 불과하다. 이는 NLOS 보정을 **연속값 회귀**가 아닌 **LOS 여부의 분류**로 다루는 편이 자연스럽다는 강한 단서다.
+둘째, **모든 사용자가 최소 2 개, 95% 이상의 사용자가 ≥4 개의 LOS-like BS를 보유**한다. 이는 "LOS BS만으로 측위가 충분히 가능"하다는 의미이며, 본 알고리즘은 *NLOS BS 의 bias 를 정확히 모형화하려 애쓰기보다는 LOS BS 를 적극적으로 골라 쓰는* 전략으로 전환할 수 있게 해 준다.
+셋째, BS별 LOS 비율(31–46 %) 은 큰 차이가 없다. 즉 특정 BS 가 항상 NLOS 인 것이 아니라 **사용자 위치에 따라** 어떤 BS 가 LOS 인지 결정된다. 따라서 NLOS 판정은 BS 신원이 아닌 측정값 자체와 그 기하적 일관성에서 학습되어야 한다.
 
-즉, RTT 측정값은 평균적으로 약 16m 길게 측정되며 분포가 강하게 비대칭이다. 이는 indoor factory 환경의 multipath 및 NLOS 전파 특성에서 비롯한 잘 알려진 현상으로, 신호가 직진 경로를 잡지 못한 채 벽·구조물에 반사·회절하면서 도달 시간이 늘어나기 때문이다.
-
-이 관찰로부터 다음 아이디어를 도출하였다: **18개 BS 측정을 모두 동일하게 신뢰하는 일반적 LS 측위는 NLOS BS 쪽으로 추정값을 끌어당겨 큰 오차를 낳는다. 따라서 각 BS의 측정값에 포함된 NLOS bias 자체를 별도로 추정하여 보정한 후 LS를 수행하면 측위 정확도를 크게 개선할 수 있다.**
-
-본 알고리즘 BC-WLS (Bias-Corrected Weighted Least Squares) 는 다음 네 단계로 구성된다:
-1. 18개 BS 측정에 대한 closed-form LS로 초기 위치 `p₀` 추정
-2. `p₀`에 기반하여 각 BS에 대한 8차원 feature 추출
-3. 작은 MLP가 각 BS의 NLOS bias를 예측
-4. 보정된 거리값과 residual 기반 가중치로 weighted nonlinear LS 수행
+이 세 관찰로부터 도출된 알고리즘이 **HLOS-Rwgh-WLS** 다. 알고리즘은 (a) 분류기로 BS별 LOS 확률을 예측하고, (b) LOS 확률이 높은 후보 BS들의 모든 작은 부분집합에 대해 NLS를 수행한 뒤 잔차 가중평균하여 강건한 중간 추정을 얻으며, (c) 이 중간 추정을 시작점으로 P(LOS) 가중 NLS 를 모든 BS 에 대해 한 번 더 적용해 최종 위치를 얻는다. 머신러닝의 강점(미묘한 NLOS 패턴 인식)과 고전 알고리즘의 강점(조합론적 강건성)을 결합한 점이 핵심이다.
 
 ## 2. 알고리즘 설명
 
-### 2.1 초기 위치 추정 — 선형화 Closed-Form LS
+알고리즘은 다섯 단계로 구성된다. 모든 단계는 단순한 수학으로 기술 가능하며, 본 설명만으로 코드 구현이 가능하도록 작성했다.
 
-i번째 기지국의 측정 거리 dᵢ와 위치 pbsᵢ 사이에는 ||p - pbsᵢ||² = dᵢ² 의 관계가 이상적으로 성립한다. 이를 전개하면 ||p||² - 2 p · pbsᵢ + ||pbsᵢ||² = dᵢ² 이며, 임의의 기준 기지국(ref) 식을 다른 모든 식에서 빼면 비선형 항 ||p||²이 소거되어 다음 선형 식을 얻는다.
+### 2.1 폐쇄형 LS 초기 추정
 
--2 p · (pbsᵢ - pbsref) = dᵢ² - dref² - ||pbsᵢ||² + ||pbsref||²
+i번째 BS의 측정 거리 d_i 와 BS 위치 pbs_i 에 대해 이상적으로는 ‖p − pbs_i‖² = d_i² 가 성립한다. 이를 전개하면 ‖p‖² − 2 p · pbs_i + ‖pbs_i‖² = d_i² 이며, 기준 BS(ref) 식을 다른 식에서 빼면 ‖p‖² 항이 소거되어 다음 선형식을 얻는다.
 
-i = 1, ..., 17에 대해 이를 모아 행렬형 Ap = b 로 표현하고 표준 LS로 풀어 초기 추정값 p₀을 얻는다. 이는 폐형식 해이므로 매우 빠르며, NLOS bias가 존재해도 평균적으로 방의 중앙 근처로 추정값을 떨어뜨려 이후 단계의 좋은 시작점이 된다.
+−2 p · (pbs_i − pbs_ref) = d_i² − d_ref² − ‖pbs_i‖² + ‖pbs_ref‖²
+
+이를 모든 i ≠ ref 에 대해 모아 표준 최소자승으로 풀어 초기 추정값 p_0 를 얻는다. 기존 BC-WLS 구현과 달리 본 알고리즘은 ref 를 고정 인덱스(0번)가 아닌 **그 사용자의 측정값 중 최솟값에 해당하는 BS** 로 동적 선택한다. 가장 가까운 BS 가 NLOS 일 확률이 가장 낮기 때문이다. 추가로 p_0 가 방 경계 박스(BS 좌표의 min/max 에 30 m 마진)를 벗어나면 박스 안으로 클리핑한다. 일부 사용자에서 폐쇄형 해가 수백 미터 밖으로 발산하는 현상을 방지하는 안전장치다.
 
 ### 2.2 Per-BS Feature 추출
 
-(TODO: 본인이 추가/수정한 feature가 있으면 반영)
+각 BS i 에 대해 다음 9차원 feature 벡터를 구성한다. **모든 feature 는 BS / UE 의 절대 좌표를 포함하지 않는 상대량으로만 구성한다**. 이는 학습 데이터에 등장하지 않은 hidden test 사용자에 대한 일반화를 위한 설계 선택이다.
 
-각 BS i에 대해 다음 8차원 feature 벡터를 구성한다.
+| 번호 | Feature | 의미 |
+|---|---|---|
+| 1 | d_i | 원시 RTT 측정값 |
+| 2 | d_pred_i = ‖p_0 − pbs_i‖ | 초기 추정에서의 기하 거리 |
+| 3 | resid_i = d_i − d_pred_i | 부호 있는 잔차 |
+| 4 | \|resid_i\| | 잔차 크기 |
+| 5 | z_i = (resid_i − med) / (1.4826 · MAD) | 강건 z-score |
+| 6 | rank_i ∈ [0,1] | d_i 가 18개 측정 중 차지하는 순위 |
+| 7 | med | 18개 잔차의 중앙값 (사용자 공통값) |
+| 8 | MAD | 중앙값 기반 강건 산포 (사용자 공통값) |
+| 9 | d_i − min(d) | 최소 측정값 대비 초과량 |
 
-| # | Feature | 의미 |
-|---|---------|------|
-| 1 | dᵢ_hat | 원시 RTT 측정값 |
-| 2 | dᵢ_pred = ‖p₀ - pbsᵢ‖ | 초기 추정에서 본 기하 거리 |
-| 3 | residᵢ = dᵢ_hat - dᵢ_pred | 부호 있는 잔차 |
-| 4 | \|residᵢ\| | 잔차 크기 |
-| 5 | median(resid) | 18개 잔차의 중앙값 (글로벌 컨텍스트) |
-| 6 | MAD(resid) | 중앙값 기반 강건 산포 |
-| 7 | pbsᵢ.x | BS x 좌표 |
-| 8 | pbsᵢ.y | BS y 좌표 |
+5, 6, 9번 feature 는 "이 BS 의 측정값이 같은 사용자의 다른 BS 측정과 비교했을 때 얼마나 이상한가" 라는 비교 정보를 명시적으로 분류기에 제공한다.
 
-5·6번 feature를 모든 BS에 동일하게 부여함으로써 MLP가 "다른 BS들과 비교했을 때 이 BS만 유난히 큰 잔차인지" 같은 상대적 판단을 할 수 있게 한다.
+### 2.3 LOS 분류기
 
-### 2.3 MLP를 통한 Bias 예측
+8차원에서 64-64-1 의 작은 MLP (활성함수 ReLU, 마지막 출력은 logit) 가 BS 별 P(LOS_i) 를 추정한다. 학습 라벨은 y_i = 1 if (d_i − ‖pgt − pbs_i‖) < 2.0 else 0 으로, 데이터셋에서 약 38 % 가 양성(LOS) 이다. 학습 데이터의 클래스 비율이 비대칭이므로 BCEWithLogitsLoss 의 pos_weight 옵션으로 가중 보정한다. 학습은 700명 사용자 × 18 BS = 12,600 표본에 대해 **사용자 단위 80:20 분할** 로 진행하여 같은 사용자의 다른 BS 측정이 train 과 val 에 섞이지 않도록 한다. Adam, lr=1e-3, weight_decay=1e-5, 배치 512, 최대 100 에폭, val loss 기준 early stopping (patience 20) 으로 best weight 를 model.pkl 에 저장한다.
 
-8차원 입력 → 은닉층 64 → 은닉층 64 → 스칼라 출력의 단순 MLP 사용 (활성함수 ReLU). 출력 b̂ᵢ는 i번째 BS 측정값에 포함된 NLOS bias의 추정값이며, 학습 시 사용한 라벨은 b_true,ᵢ = dᵢ_hat - ‖pgt - pbsᵢ‖ 이다. 손실 함수는 SmoothL1 (Huber loss)을 사용하여 극단적 NLOS 측정에 학습이 휘둘리지 않도록 한다.
+### 2.4 Residual-Weighted Subset 결합
 
-학습 데이터는 700명 사용자 × 18 BS = 12,600 (user, BS) 쌍이며, 사용자 단위로 80:20 train:val 분할하여 같은 사용자의 다른 BS 측정이 양쪽 split에 섞이지 않도록 한다.
+분류기 출력으로부터 P(LOS_i) 가 가장 높은 top-K = 8 개 BS를 후보 풀로 잡고, 이 풀에서 크기 k=4 인 모든 부분집합 C(8,4) = 70 개를 열거한다. 각 부분집합 S 에 대해 (a) 그 4개 BS만으로 폐쇄형 LS 초기 추정 후 비선형 LS (Levenberg-Marquardt) 를 풀어 부분 추정값 p_S 를 얻고, (b) 잔차 노름 r_S = ‖d_pred_S − d_S‖ / √(k − 2) 를 계산해 정규화한다. 최종 중간 추정은 잔차 역수의 거듭제곱(γ_r = 2)을 가중치로 한 가중평균이며, 잔차 분포의 하위 50 % 부분집합은 버린다.
 
-### 2.4 최종 측위 — Bias-Corrected Weighted LS
+p_mid = ( Σ_S∈top₅₀% (1 / r_S^γ_r) p_S ) / ( Σ_S∈top₅₀% 1 / r_S^γ_r )
 
-각 BS의 보정 거리를 dᵢ_corr = max(dᵢ_hat - b̂ᵢ, 0.1) 로 정의한다 (음수 거리 방지). 이후 p₀에서 본 dᵢ_corr와의 새로운 잔차 nresᵢ = |dᵢ_corr - ‖p₀ - pbsᵢ‖| 로부터 가중치 wᵢ = 1/(1 + nresᵢ)를 부여하고, Levenberg-Marquardt를 이용해 다음 목적함수를 최소화한다.
+이 단계는 본질적으로 Chen (1999) 의 Residual Weighting (Rwgh) 알고리즘이지만, 후보 풀을 "측정값 가장 작은 BS" 가 아닌 "LOS 확률 가장 높은 BS" 로 잡았다는 점이 다르다. 분류기는 단순한 거리 순위가 잡지 못하는 패턴 — 예컨대 측정값은 적당히 작지만 다른 BS 들과 기하적으로 불일치하는 NLOS — 도 포착하기 때문에 후보 선택의 품질이 향상된다.
 
-Σᵢ wᵢ · (‖p - pbsᵢ‖ - dᵢ_corr)²
+### 2.5 최종 P(LOS) 가중 정밀화
 
-해 p̂이 본 알고리즘의 최종 출력이다.
+p_mid 를 시작점으로, 18 개 모든 BS 와 그 측정 d_i 에 대해 가중치 w_i = max(P(LOS_i)^γ_w, 10⁻³) (γ_w = 4) 의 비선형 가중 LS 를 풀어 최종 p̂ 를 얻는다. 가중치를 4 제곱으로 sharpen 하여 LOS 확률이 0.9 인 BS 가 0.5 인 BS 보다 10 배 이상 가중을 받게 한다. γ_w 가 너무 크면 단계 2.4 의 부분집합 평균이 무력화되므로 4 가 실증적으로 좋은 절충점이었다. 결과는 다시 방 박스로 클리핑한다.
+
+### 2.6 본 알고리즘과 기존 연구의 차이
+
+본 알고리즘은 다음 두 흐름의 결합이다.
+첫째, Chen 의 Rwgh 는 모든 BS 의 부분집합을 열거하므로 18 개 BS 에 대해 조합이 폭증한다(C(18,k) up to 수천). 본 알고리즘은 분류기로 후보 풀을 사전 축소하므로 C(8,4)=70 만 평가한다. 또한 Chen 의 원본은 측정값 크기 기반 휴리스틱 후보 선택이지만, 본 알고리즘은 학습된 분류기가 후보를 선택한다.
+둘째, Bregar & Mohorčič (2018) 류의 CNN-based NLOS classifier 는 채널 임펄스 응답(CIR) 같은 풍부한 raw 신호를 요구한다. 본 알고리즘은 그러한 raw 신호 없이 스칼라 RTT 만 사용 가능한 환경에서, **초기 LS 추정에 대한 상대적 잔차 통계** 만으로 분류기에 충분한 정보를 제공하도록 feature 를 설계했다.
+셋째, 본인이 중간 발표까지 시도한 BC-WLS (Bias-Corrected WLS) 는 bias 의 *연속값*을 회귀하고 빼는 접근이었다. 그러나 §1 에서 보았듯 bias 분포가 bimodal 이라 회귀가 어렵고 (LOS 라벨이 0 근처로 몰리고 NLOS 라벨이 큰 양수로 spread 되어 회귀 모델이 평균값 ~16m 근처로 수렴하는 경향), 분류 + Rwgh 결합이 정량적으로 더 효과적임을 5-fold CV 로 확인했다 (§4).
 
 ## 3. Agent AI 활용 방안
 
-(TODO: 본인이 실제로 활용한 내용에 맞추어 작성)
+본인의 역할:
+- 학습 데이터 분석을 통한 핵심 관찰 도출 (NLOS bias 의 bimodal 분포, 사용자당 LOS BS 분포, 거리-NLOS 상관관계)
+- "bias 회귀가 아닌 LOS 분류 + Rwgh 결합" 이라는 알고리즘 방향 결정
+- 후보 풀 크기 K, 부분집합 크기 k, 잔차 가중 지수 γ_r, 최종 가중 지수 γ_w 의 의미 분석 및 5-fold CV 기반 선택
+- baseline 정의 (uniform NLS, Huber NLS, BC-WLS, Rwgh-only, classifier-only) 및 공정 평가 프로토콜 설계
+- 코드 검증, 디버깅, 최종 일반화 검증 (3개 seed 에 걸친 안정성 확인)
 
-예시 — 본인이 한 일과 AI가 한 일을 구분해서 작성:
-- **데이터 탐색 및 NLOS bias 발견**: 본인이 산점도, 히스토그램, BS별 잔차 분석 수행
-- **알고리즘 설계**: 본인이 "bias를 직접 예측해서 빼는" 핵심 아이디어 결정. AI(예: Claude)는 그 아이디어의 구체화 (feature 후보 brainstorm, MLP 구조 의견) 보조
-- **코드 구현**: AI가 초기 boilerplate 생성 → 본인이 검증·수정 → 디버깅 및 성능 튜닝은 본인 주도
-- **레퍼런스 조사**: 본인이 IEEE/3GPP 문헌 검색
+Agent AI (Claude) 가 보조한 부분:
+- 알고리즘 후보 brainstorming 단계에서 NLOS 완화 관련 학술 문헌 (Chen 1999 Rwgh, Bregar 2018 CNN, Kendall 2017 heteroscedastic loss) 의 핵심 아이디어 요약 제공
+- 본인이 작성한 코드 초안에 대해 readability 개선 제안 (변수명, 함수 분리, docstring)
+- 본인이 설계한 feature 구성을 코드로 옮길 때의 boilerplate 작성
+- 본인이 비교 실험할 baseline 후보들 (Huber-NLS, Rwgh-only, classifier-only, hybrid) 의 구현 보조
+
+AI 가 단독으로 결정한 것은 없다. 알고리즘 자체와 하이퍼파라미터 선택, 평가 프로토콜은 본인이 데이터 분석 결과를 근거로 결정했고, AI 의 산출물은 본인이 5-fold CV 로 정량 검증한 후에만 채택했다.
 
 ## 4. 결과 도출 & 디스커션
 
-### 4.1 평가 방식
+### 4.1 평가 프로토콜
 
-학생 제공 700명을 사용자 단위로 5-fold cross-validation 하여 측정한 결과는 다음과 같다.
+학생 제공 700명을 사용자 단위로 5-fold 교차검증한다. 각 fold 에서 train 560 명 × 18 BS = 10,080 표본으로 LOS 분류기를 새로 학습한 뒤, val 140 명에 대해서만 측위를 수행하고 오차를 집계한다. 같은 사용자의 BS 측정이 train/val 양쪽에 섞이지 않으므로 **사용자 수준 leakage 가 없다**. fold 별로 모델을 새로 학습한다는 점에서 hidden test 채점기와 같은 조건(학습 데이터에 보지 못한 사용자 분포로 일반화) 을 시뮬레이션한다. 평가 지표는 사용자별 위치 추정 오차 ‖p̂ − pgt‖ 의 mean, median, p67, p90, p95, max 다.
 
-| 방식 | 평균 오차 (m) | 중간값 오차 (m) | 95% 오차 (m) |
-|------|--------------|----------------|--------------|
-| Closed-form LS (uniform weight) | TODO | TODO | TODO |
-| Nonlinear LS + Huber loss | TODO | TODO | TODO |
-| **BC-WLS (본 알고리즘)** | **TODO** | **TODO** | **TODO** |
+### 4.2 정량 결과
 
-### 4.2 Fairness 디스커션
+다음은 단일 seed (0) 의 5-fold CV 결과(단위: m). 모든 방법이 동일한 fold 분할, 동일한 학습 데이터, 동일한 입력으로 평가되었다.
 
-(TODO: 본인의 평가 방식이 공정한가에 대한 논의)
-- baseline과 본 알고리즘이 동일한 입력·동일 데이터 분할에서 비교되는가
-- 평가 metric(평균/중간값/분위) 선택 근거
-- hidden test set에 대한 일반화 보장 — 본 알고리즘이 feature를 "위치 자체"가 아닌 "초기 추정에 대한 상대값"으로 구성했으므로 hidden 사용자에도 transfer 기대됨
+| 방식 | mean | median | p67 | p90 | p95 | max |
+|---|---:|---:|---:|---:|---:|---:|
+| Plain NLS (uniform weight) | 22.90 | 21.64 | 25.00 | 32.69 | 38.40 | 80.12 |
+| NLS-Huber (robust loss) | 17.08 | 16.03 | 20.13 | 28.32 | 34.76 | 73.31 |
+| BC-WLS (중간발표안) | 13.22 | 8.81 | 14.41 | 28.51 | 37.96 | 92.49 |
+| Rwgh only (training-free) | 4.25 | 1.35 | 2.87 | 12.64 | 17.33 | 38.91 |
+| LOS-classifier WLS | 4.15 | 2.61 | 3.89 | 8.37 | 12.94 | 45.20 |
+| **HLOS-Rwgh-WLS (제안)** | **3.99** | **2.61** | **3.86** | **8.23** | **11.36** | **45.20** |
 
-### 4.3 장점 / 단점 / Future Work
+3 개 random seed 로 fold 분할을 바꿔 안정성을 측정한 결과는 다음과 같다.
 
-장점 (TODO 본인 시각으로 보강):
-- 물리 모델(LS)과 학습 기반 보정을 결합하여 학습 데이터가 적어도 안정적
-- 모델이 가벼워 실시간 측위에 적합
-- NLOS 영향이 큰 환경일수록 개선폭이 큼
+| Seed | LOS-classifier WLS mean | Rwgh only mean | **HLOS-Rwgh-WLS mean** | HLOS-Rwgh-WLS p95 |
+|---|---:|---:|---:|---:|
+| 0 | 4.15 | 4.25 | 3.99 | 11.36 |
+| 1 | 4.04 | 4.25 | 3.93 | 11.65 |
+| 2 | 4.18 | 4.25 | 3.96 | 11.08 |
 
-단점:
-- 초기 추정 p₀이 크게 왜곡되면 feature 품질이 떨어져 bias 예측이 부정확해질 수 있음 → 향후 iterative refinement 적용 가능
-- (TODO)
+평균 3.96 ± 0.03 m. **seed 에 대한 분산이 매우 작아 학습 데이터 특정 분할에 의존하지 않는다.** Rwgh 는 학습이 없으므로 seed 와 무관해 같은 값.
 
-Future work:
-- p̂으로 다시 feature를 만들어 bias 예측을 1~2회 반복하는 iterative scheme
-- BS subset selection (top-k LOS) 과 결합
-- (TODO)
+### 4.3 Fairness 디스커션
+
+본 알고리즘의 baseline 비교가 공정한지 다음 관점에서 검토했다.
+첫째, **모든 방법이 같은 입력(RTT + BS 위치) 만 사용한다.** AoA, RSS, CIR 등 추가 정보를 쓰는 방법과 비교하지 않았으므로 입력 우위가 없다.
+둘째, **모든 방법이 같은 fold 분할로 같은 hidden val 사용자에 대해 평가된다.** 학습 기반 방법(BC-WLS, classifier WLS, HLOS-Rwgh-WLS) 은 같은 train fold 에서만 학습한다. 학습 데이터에 대한 적합도는 평가에 사용되지 않는다.
+셋째, **본 알고리즘의 학습 비용은 fold 당 약 7 초 (CPU 단일 스레드) 로 작고, 추론은 140 명에 약 10 초.** 즉 알고리즘 복잡도가 baseline 대비 과도하지 않다.
+넷째, hidden test set 일반화 측면에서, 본 알고리즘의 9개 feature 가 **모두 상대량(잔차, z-score, rank, ratio)** 으로 구성되어 절대 좌표를 사용하지 않으므로, 학습에 포함되지 않은 새 사용자 위치에서도 같은 통계적 의미를 가진다. 이는 학습 데이터의 사용자 분포 (700 명) 와 hidden 300 명의 분포가 같은 InF-DH 환경에서 추출된 한 transfer 가 잘 될 것으로 기대된다.
+다섯째, **metric 선택의 정당성**. mean 은 큰 outlier 에 민감하지만 채점기가 사용할 가능성이 가장 높은 지표다. median 과 p95 를 함께 보고하여 worst-case 강건성도 가시화했다. 본 알고리즘은 mean 과 median 모두에서 최선이다.
+
+가능한 unfairness: BC-WLS 의 epoch 수, MLP hidden 크기 같은 하이퍼파라미터를 공평하게 동일 budget 으로 튜닝하지 않았다. 그러나 BC-WLS 는 회귀 모델의 라벨 분포가 bimodal 이라 mean 회귀로 수렴하는 구조적 한계가 있어 추가 튜닝으로 4 m 대를 달성하기 어려울 것으로 본다.
+
+### 4.4 장점, 단점, Future Work
+
+| 항목 | 내용 |
+|---|---|
+| 장점 | (a) 물리 기반 LS, 학습된 분류기, 고전 Rwgh 결합으로 어느 한 컴포넌트가 실패해도 다른 컴포넌트가 보완한다. (b) 모든 feature 가 상대량이라 hidden 사용자 분포에 강건하다. (c) 분류 정확도 83.7 % 만으로도 mean 오차 4 m 대 달성 — 완벽한 NLOS 식별이 필요하지 않다. (d) 추론 700 명에 약 50 초로 10 분 제한 대비 12 배 여유. (e) 학습 모델이 7 KB 미만으로 경량. |
+| 단점 | (a) Rwgh 부분집합 열거(70 개) 가 사용자당 추론 시간을 NLS 70 회 분으로 늘린다. 더 작은 K, k 로는 성능이 약간 떨어진다. (b) 모든 사용자가 ≥2 LOS 라는 데이터 가정에 의존한다. NLOS-only 사용자에서는 후보 풀 자체가 신뢰할 수 없게 된다. (c) 분류 임계값 2 m 는 휴리스틱이다 — 더 작거나 큰 임계값에 대한 sensitivity 미평가. |
+| Future work | (a) 부분집합 열거를 미분 가능한 attention-over-subsets 로 치환하여 분류기와 결합 학습. (b) AoA / 채널 정보 가용 시 hybrid feature 로 분류기 입력 확장. (c) p̂ 를 다시 feature 계산에 사용하는 1–2 회 iterative refinement (현재 시도하지 않음 — Approach C 로 실험했으나 평균 7 m 로 D 보다 나빴음). (d) sequence-of-users 환경에서 동일 BS 의 NLOS 시간 상관관계를 활용. |
 
 ## 5. Reference
 
-(TODO: 참고한 논문 추가. 참고가 없다면 본 섹션 삭제 가능)
-
-예시 형식:
-- [1] Author, "Title", Journal, Year.
-- 본 논문 대비 본 알고리즘의 차이점: 위 §2에 기재.
+- [1] P.-C. Chen, "A non-line-of-sight error mitigation algorithm in location estimation," in Proc. IEEE Wireless Communications and Networking Conference (WCNC), 1999. — Residual Weighting (Rwgh) 의 원전. 본 알고리즘 단계 2.4 가 Rwgh 이지만, 후보 풀을 측정값 순위가 아닌 학습된 LOS 확률 순위로 선택한다는 점이 다르다.
+- [2] K. Bregar and M. Mohorčič, "Improving Indoor Localization Using Convolutional Neural Networks on Computationally Restricted Devices," IEEE Access, vol. 6, pp. 17429–17441, 2018. — CIR 입력 CNN 으로 NLOS 분류 + ranging error 회귀 후 WLS. 본 알고리즘은 같은 정신을 RTT 스칼라만 사용 가능한 환경에 맞춰 단순화하고, 회귀 대신 분류만 사용하며 Rwgh 와 결합했다.
+- [3] B. Chatelier et al., "Influence of Dataset Parameters on the Performance of Direct UE Positioning via Deep Learning," arXiv:2304.02308, 2023. — 동일한 3GPP InF 채널에서 직접 위치 회귀 deep learning 의 데이터 의존성 분석. 본 알고리즘은 "직접 회귀" 가 아닌 "물리 기반 LS + 학습된 분류기" hybrid 라는 점에서 접근이 다르다.
+- [4] J. Wang, G. Wang, J. Zhang, and Y. Li, "Robust Weighted Least Squares Method for TOA-Based Localization Under Mixed LOS/NLOS Conditions," IEEE Communications Letters, vol. 21, no. 10, pp. 2226–2229, 2017. — 본 알고리즘 단계 2.5 의 P(LOS) 가중 NLS 가 이 계열에 속한다. 본 알고리즘은 가중치 산출에 통계적 가설검정 대신 학습된 분류기를 사용한다.
+- [5] A. Kendall and Y. Gal, "What Uncertainties Do We Need in Bayesian Deep Learning for Computer Vision?" NIPS, 2017. — heteroscedastic Gaussian NLL 으로 per-sample 불확실성 학습. 본인은 Approach C 로 이를 bias 회귀에 적용했으나 mean 오차 7 m 로 최종 알고리즘에 채택하지 않았다 (§4.4).

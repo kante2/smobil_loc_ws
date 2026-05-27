@@ -1,23 +1,8 @@
-# Data (do not push course-provided dataset)
-*.mat
-
-# Python
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
-
-# Environments
-.venv/
-venv/
-env/
-
-# IDE
-.vscode/
-.idea/
-
-# OS
 .DS_Store
-Thumbs.db
+.venv/
+.env
 
-# Logs
-*.log
+# NOTE: do NOT ignore model.pkl — it must be committed for the grader to run main.py

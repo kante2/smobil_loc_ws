@@ -5,7 +5,7 @@ Run:  python train.py
 
 For each (user, BS) pair we have:
   - feature vector x_i (built from RTT + warm-start residual geometry)
-  - binary label y_i  =  1 if true bias < 3 m else 0  (i.e. LOS-like vs NLOS)
+  - binary label y_i  =  1 if true bias < 2 m else 0  (i.e. LOS-like vs NLOS)
 
 We train a small MLP with BCE (+pos_weight to handle class imbalance,
 LOS ratio ~ 34 %). User-level 80:20 split prevents leakage between BS
@@ -83,22 +83,20 @@ def main():
     torch.manual_seed(0)
     model = LOSClassifier(in_dim=FEATURE_DIM, hidden=64)
     opt = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=200)
     # class imbalance handling (LOS is the minority class)
     pos_weight = torch.tensor([(1 - ytr.mean()) / (ytr.mean() + 1e-6)],
                               dtype=torch.float32)
     loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
-    EPOCHS = 200
+    EPOCHS = 200 # 100 -> 200
     best_val = float('inf')
-    patience, wait = 30, 0
+    patience, wait = 30, 0 # 20, 0 -> 30, 0
     for ep in range(EPOCHS):
         model.train()
         for xb, yb in loader:
             opt.zero_grad()
             loss_fn(model(xb), yb).backward()
             opt.step()
-        scheduler.step()
 
         model.eval()
         with torch.no_grad():

@@ -1,56 +1,37 @@
 """
-Inference entry point. The grader executes `python main.py` and calls main().
-Returns a (2, num_user) numpy array of predicted positions.
+Inference entry point. The grader executes `python main.py` which calls
+main(); main() returns a (2, num_user) numpy array of predicted positions.
+
+Algorithm: HLOS-Rwgh-WLS  (see model.py docstring).
 """
 import numpy as np
 import scipy.io as sio
 import torch
 
 from model import (
-    BiasMLP, FEATURE_DIM,
-    linear_ls_init, nonlinear_wls, extract_features,
+    LOSClassifier,
+    FEATURE_DIM,
+    predict_position,
 )
 
 
 def your_algorithm(d, p_bs, model):
-    """
-    Locate one user with bias-corrected weighted LS.
-    d   : (18,)   RTT measurements
-    p_bs: (2, 18) BS coordinates
-    model: trained BiasMLP
-    Returns (2,) estimated position.
-    """
-    # 1. closed-form warm-start
-    p0 = linear_ls_init(d, p_bs)
-
-    # 2. predict per-BS NLOS bias
-    feats = extract_features(d, p_bs, p0)
-    with torch.no_grad():
-        bias_hat = model(torch.from_numpy(feats)).numpy()  # (18,)
-
-    # 3. correct the measurements (clip to small positive)
-    d_corr = np.maximum(d - bias_hat, 0.1)
-
-    # 4. confidence weights — downweight large residuals after correction
-    d_pred = np.linalg.norm(p0[:, None] - p_bs, axis=0)
-    new_resid = np.abs(d_corr - d_pred)
-    w = 1.0 / (1.0 + new_resid)
-
-    # 5. final weighted nonlinear LS
-    p_hat = nonlinear_wls(p0, d_corr, p_bs, w)
-    return p_hat
+    """Locate one user. d:(18,), p_bs:(2,18) -> (2,)"""
+    return predict_position(d, p_bs, model)
 
 
 def main():
-    # 1) load data — grader places file in cwd with this name
+    # 1) load .mat (grader places it in cwd)
     mat_path = 'DH_FR1.mat'
     data = sio.loadmat(mat_path, squeeze_me=False)
-    # Accept either variable naming (spec says p_bs, sample file uses BS_positions)
+
+    # accept either variable naming (README spec says p_bs;
+    # provided sample uses BS_positions — keep both)
     p_bs = np.asarray(data.get('p_bs', data.get('BS_positions')), dtype=float)
     d_hat = np.asarray(data['d_hat'], dtype=float)
 
-    # 2) load trained model
-    model = BiasMLP(in_dim=FEATURE_DIM)
+    # 2) load trained classifier
+    model = LOSClassifier(in_dim=FEATURE_DIM)
     state = torch.load('model.pkl', map_location='cpu', weights_only=True)
     model.load_state_dict(state)
     model.eval()

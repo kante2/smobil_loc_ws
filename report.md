@@ -1,5 +1,7 @@
 # InF FR1 Indoor Positioning — HLOS-Rwgh-WLS
 
+## 12226317 이강태
+
 ## 1. 모티베이션 & 인트로
 
 본 과제는 18개 기지국이 측정한 RTT 거리 d_hat (18, N) 로부터 3GPP InF-DH (Indoor Factory, Dense High clutter) 시나리오에서 사용자의 2D 위치를 추정하는 문제다. 학습 단계에서 제공된 700명의 측정값과 실제 위치를 분석해 다음 현상들을 관찰했다.

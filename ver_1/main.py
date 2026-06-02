@@ -2,7 +2,7 @@
 Inference entry point. The grader executes `python main.py` which calls
 main(); main() returns a (2, num_user) numpy array of predicted positions.
 
-Algorithm: HLOS-Rwgh-OWLS  (see model.py docstring).
+Algorithm: HLOS-Rwgh-WLS  (see model.py docstring).
 """
 import numpy as np
 import scipy.io as sio

@@ -1,39 +1,27 @@
 """
-Model and shared helpers for HLOS-Rwgh-OWLS positioning.
+Model and shared helpers for HLOS-Rwgh-WLS positioning.
 
 Module is imported by both train.py and main.py.
 
-Algorithm short name : HLOS-Rwgh-OWLS
-                       (Hybrid LOS-classifier + Residual-Weighted-subset +
-                        NLOS-aware One-sided robust WLS)
+Algorithm short name : HLOS-Rwgh-WLS
+                       (Hybrid LOS-classifier + Residual-Weighted-Subset + WLS)
 
 Pipeline (no absolute coordinates used as features, for generalization):
   step 1 : closed-form linear LS warm start, clipped to room box
   step 2 : per-BS feature vector -> small MLP -> P(LOS_i)
   step 3 : take top-K BSes by P(LOS_i), enumerate k-subsets, solve NLS in each
-  step 4 : keep the single subset with the lowest normalized residual
-           (Rwgh ranking) as the mid estimate
-  step 5 : final NLOS-AWARE refinement over all 18 BSes, warm started from
-           step 4. Each BS contributes:
-             - LOS-like (high P(LOS)) : two-sided P(LOS)^gamma-weighted term
-             - NLOS-like (low P(LOS)) : ONE-SIDED hinge that penalizes only an
-               overshoot beyond the measured distance. Because an NLOS RTT is
-               inflated, the true distance is <= the measurement, so a measured
-               value is a valid UPPER BOUND. This recovers geometric information
-               from NLOS BSes that simple down-weighting throws away -> it helps
-               most for users with few LOS BSes (the error tail).
-           A soft_l1 robust loss caps the leverage of any single residual so a
-           misclassified BS cannot dominate the fit.
+  step 4 : combine subsets weighted by inverse residual^gamma (Chen 1999 Rwgh)
+  step 5 : final P(LOS_i)^gamma weighted NLS over all 18 BSes, warm started
+           from step 4's combined estimate
 
 Reference papers:
   [Chen99]    P.-C. Chen, "A non-line-of-sight error mitigation algorithm
-              in location estimation," IEEE WCNC 1999.  (Rwgh residual ranking)
-  [Breg18]    K. Bregar & M. Mohorcic, "Improving Indoor Localization Using
+              in location estimation," IEEE WCNC 1999.
+  [Breg18]    K. Bregar & M. Mohorčič, "Improving Indoor Localization Using
               Convolutional Neural Networks on Computationally Restricted
-              Devices," IEEE Access 2018.  (learned NLOS identification)
-  [Guvenc09]  I. Guvenc & C.-C. Chong, "A Survey on TOA Based Wireless
-              Localization and NLOS Mitigation Techniques," IEEE Comm. Surveys
-              2009.  (NLOS measurement as a one-sided / inequality constraint)
+              Devices," IEEE Access 2018.
+  [Kend17]    A. Kendall & Y. Gal, "What Uncertainties Do We Need ...", NIPS 2017
+              (heteroscedastic loss — explored as Approach C but not chosen).
 """
 from itertools import combinations
 
@@ -77,40 +65,12 @@ def linear_ls_init(d, p_bs, ref=None):
 
 
 def nonlinear_wls(p0, d, p_bs, w=None, max_nfev=80):
-    """Plain (two-sided) weighted NLS, used inside the subset solves (fast LM)."""
     if w is None:
         w = np.ones(p_bs.shape[1])
     sw = np.sqrt(np.maximum(w, 0.0))
     def res(p):
         return sw * (np.linalg.norm(p[:, None] - p_bs, axis=0) - d)
     return least_squares(res, p0, method='lm', max_nfev=max_nfev).x
-
-
-def nonlinear_wls_onesided(p0, d, p_bs, p_los,
-                           w_pow=12.0, nlos_w=1.0, f_scale=3.0, max_nfev=150):
-    """
-    Final NLOS-aware refinement over all BSes.
-
-    Gap for BS i:  g_i = ||p - bs_i|| - d_i   (predicted minus measured)
-      LOS-like  (high P(LOS)) : two-sided term  P(LOS)_i^w_pow * g_i
-                                -> must match the measurement on both sides.
-      NLOS-like (low  P(LOS)) : one-sided hinge (1-P(LOS))_i * nlos_w * max(g_i,0)
-                                -> NLOS RTT is inflated, so true distance <= d_i;
-                                   only an overshoot is penalized, an undershoot
-                                   is consistent with NLOS bias and stays free.
-    soft_l1 robust loss caps the influence of any single (possibly mislabeled)
-    residual.
-    """
-    w_los = np.maximum(p_los ** w_pow, 1e-3)
-    w_nlos = (1.0 - p_los) * nlos_w
-
-    def res(p):
-        g = np.linalg.norm(p[:, None] - p_bs, axis=0) - d
-        return np.concatenate([w_los * g, w_nlos * np.maximum(g, 0.0)])
-
-    sol = least_squares(res, p0, method='trf', loss='soft_l1',
-                        f_scale=f_scale, max_nfev=max_nfev)
-    return sol.x
 
 
 # ============================================================
@@ -173,11 +133,11 @@ def extract_features(d, p_bs, p0):
 # ============================================================
 # Final prediction function
 # ============================================================
-LOS_BIAS_THRESHOLD = 3.0   # used as label threshold during training
+LOS_BIAS_THRESHOLD = 3.0   # used as label threshold during training 2.0 -> 3.0
 
 
 def predict_position(d, p_bs, model,
-                     top_k=8, k_subset=4, gamma_r=2.0, gamma_w=12.0, nlos_w=1.0):
+                     top_k=8, k_subset=4, gamma_r=2.0, gamma_w=12.0): # 4.0 -> 6.0 -> 12.0
     """
     Locate one user.
 
@@ -203,20 +163,27 @@ def predict_position(d, p_bs, model,
     K = min(top_k, M)
     cand = np.argsort(-p_los)[:K]
 
-    # ---- 4. Rwgh: enumerate k-subsets, keep the lowest-residual one ----
-    best_p, best_score = None, -np.inf
+    # ---- 4. Rwgh: residual-weighted subset combination ----
+    estimates, inv_res = [], []
     for combo in combinations(cand, k_subset):
         idx = np.array(combo)
         p0_loc = clip_to_room(linear_ls_init(d[idx], p_bs[:, idx]), box)
-        p_sub = clip_to_room(nonlinear_wls(p0_loc, d[idx], p_bs[:, idx]), box)
+        p_sub = nonlinear_wls(p0_loc, d[idx], p_bs[:, idx])
+        p_sub = clip_to_room(p_sub, box)
         d_pred = np.linalg.norm(p_sub[:, None] - p_bs[:, idx], axis=0)
         r = np.linalg.norm(d_pred - d[idx]) / np.sqrt(k_subset - 2 + 1e-9)
-        score = 1.0 / (r ** gamma_r + 1e-6)
-        if score > best_score:
-            best_score, best_p = score, p_sub
-    p_mid = clip_to_room(best_p, box)
+        estimates.append(p_sub)
+        inv_res.append(1.0 / (r ** gamma_r + 1e-6))
+    estimates = np.stack(estimates)
+    inv_res = np.asarray(inv_res)
+    # drop the worst half of subsets, weight rest by inv_res
+    cutoff = np.percentile(inv_res, 50)
+    mask = inv_res >= cutoff
+    w_sub = inv_res[mask] / inv_res[mask].sum()
+    p_mid = (estimates[mask] * w_sub[:, None]).sum(axis=0)
+    p_mid = clip_to_room(p_mid, box)
 
-    # ---- 5. final NLOS-aware one-sided robust refinement over all BSes ----
-    p_hat = nonlinear_wls_onesided(p_mid, d, p_bs, p_los,
-                                   w_pow=gamma_w, nlos_w=nlos_w)
+    # ---- 5. final refinement: P(LOS)^gamma-weighted NLS over all BSes ----
+    w_final = np.maximum(p_los ** gamma_w, 1e-3)
+    p_hat = nonlinear_wls(p_mid, d, p_bs, w_final)
     return clip_to_room(p_hat, box)

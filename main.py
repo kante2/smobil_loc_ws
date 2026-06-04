@@ -2,13 +2,16 @@
 Inference entry point. The grader executes `python main.py` which calls
 main(); main() returns a (2, num_user) numpy array of predicted positions.
 
-Algorithm: HLOS-Rwgh-OWLS  (see model.py docstring).
+Algorithm: HLOS-Rwgh-OWLS  (see train.py docstring).
+
+The algorithm and model definitions now live in train.py; importing them
+here does NOT trigger training (train.main() is guarded by __main__).
 """
 import numpy as np
 import scipy.io as sio
 import torch
 
-from model import (
+from train import (
     LOSClassifier,
     FEATURE_DIM,
     predict_position,
